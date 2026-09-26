@@ -1,0 +1,24 @@
+# Environments
+venv/
+env/
+.env
+
+# Python specific
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Output directories
+dist/
+build/
+*.egg-info/
+
+# Agent generated artifacts
+output/
+audit-report.md
+fix-brief.md
+
+# OS specific
+.DS_Store
+Thumbs.db
