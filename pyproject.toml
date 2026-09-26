@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vtest-agent"
+version = "0.1.0"
+description = "AI-Powered Local Code Diagnostic Agent"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "pydantic>=2.0.0",
+    "networkx>=3.0",
+    "pathspec>=0.11.0"
+]
+
+[project.scripts]
+vtest = "vtest.main:app"
