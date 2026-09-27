@@ -45,11 +45,22 @@ def scan_codebase(base_path: str) -> dict:
             if ext:
                 file_extensions[ext] = file_extensions.get(ext, 0) + 1
             
-            if file in framework_indicators and detected_framework == "Unknown":
-                detected_framework = framework_indicators[file]
-                
-            if ext == ".py":
-                source_files.append(file_path)
+            # Deep Framework Detection
+            if detected_framework == "Unknown":
+                if file == "requirements.txt":
+                    content = file_path.read_text(errors="ignore").lower()
+                    if "fastapi" in content:
+                        detected_framework = "FastAPI"
+                    elif "flask" in content:
+                        detected_framework = "Flask"
+                    elif "django" in content:
+                        detected_framework = "Django"
+                elif file == "package.json":
+                    content = file_path.read_text(errors="ignore").lower()
+                    if "next" in content:
+                        detected_framework = "Next.js"
+                    elif "express" in content:
+                        detected_framework = "Express"
                 
     primary_ext = max(file_extensions, key=file_extensions.get) if file_extensions else ""
     ext_to_lang = {".java": "Java", ".py": "Python", ".ts": "TypeScript", ".tsx": "TypeScript/React", ".js": "JavaScript"}
