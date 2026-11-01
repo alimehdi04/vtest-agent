@@ -13,7 +13,10 @@ dependencies = [
     "rich>=13.0.0",
     "pydantic>=2.0.0",
     "networkx>=3.0",
-    "pathspec>=0.11.0"
+    "pathspec>=0.11.0",
+    # LLM client: llm.py uses max_completion_tokens and reasoning_effort (verified on groq 1.4.0).
+    "groq>=1.4.0,<2",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.scripts]
