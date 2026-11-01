@@ -3,9 +3,12 @@ from pathlib import Path
 
 # Adjust the import path based on your exact folder structure
 from vtest.agents.unit_agent import run
+from vtest.core.llm import allow_uploads
 
 async def execute_checkpoint():
     print("🚀 Starting vtest Checkpoint...")
+    # This developer script exists to exercise the Groq pipeline, so it opts in explicitly (M5).
+    allow_uploads(True)
     
     repo_root = Path(".")
     target_file = repo_root / "math_ops.py"

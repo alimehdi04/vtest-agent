@@ -7,7 +7,7 @@ def _get_pathspec(base_path: Path):
     """Loads .gitignore rules and appends absolute fail-safes."""
     lines = [".git/", "node_modules/", "venv/", ".venv/", "__pycache__/", "dist/", ".idea/"]
     gitignore = base_path / ".gitignore"
-    if gitignore.exists():
+    if gitignore.is_file() and not gitignore.is_symlink():
         lines.extend(gitignore.read_text(errors="ignore").splitlines())
     return pathspec.PathSpec.from_lines(pathspec.patterns.GitWildMatchPattern, lines)
 
@@ -45,8 +45,8 @@ def scan_codebase(base_path: str) -> dict:
             if ext:
                 file_extensions[ext] = file_extensions.get(ext, 0) + 1
             
-            # Deep Framework Detection
-            if detected_framework == "Unknown":
+            # Deep Framework Detection (M2: never read through a symlink)
+            if detected_framework == "Unknown" and not file_path.is_symlink():
                 if file == "requirements.txt":
                     content = file_path.read_text(errors="ignore").lower()
                     if "fastapi" in content:

@@ -57,47 +57,108 @@
 #         return [{"id": "ERR", "issue": "Failed to parse Semgrep output", "severity": "High", "category": "System", "file_line": "N/A", "agent": "Security"}]
 
 import json
-import asyncio
+import re
 from pathlib import Path
 
 from vtest.core.models import AgentResult, AgentType, Finding, Severity
-from vtest.core.runner import SubprocessError, run_command
+from vtest.core.runner import SubprocessError, run_tool
 
-async def run(files: list[Path], repo_root: Path, start_id: int = 1) -> AgentResult:
+# Semgrep's JSON report for a large repository can be tens of MB. Semgrep is a
+# trusted host tool, so it gets a higher cap than sandboxed output (1 MB).
+SEMGREP_MAX_OUTPUT = 64 * 1024 * 1024
+SEMGREP_TIMEOUT = 300
+
+# L1: an explicit, pinned ruleset instead of "--config auto" (which requires metrics
+# and sends project metadata to pick rules). Note that "p/..." is a Semgrep Registry
+# pack: its rules are still downloaded from semgrep.dev, but no telemetry is sent.
+# For a fully offline scan, pass a vendored rules file or directory (--semgrep-config).
+DEFAULT_SEMGREP_CONFIG = "p/owasp-top-ten"
+_REGISTRY_PACK_RE = re.compile(r"^p/[a-z0-9][a-z0-9-]{0,63}$")
+
+
+class SemgrepConfigError(ValueError):
+    pass
+
+
+def resolve_semgrep_config(config: str) -> str:
     """
-    Runs Semgrep locally using OWASP rules and maps findings to Pydantic models.
+    Accept either a registry pack id ("p/owasp-top-ten") or a local rules file
+    or directory (not a symlink). Anything else (URLs, "auto", other flags) is rejected.
     """
-    findings = []
-    
-    cmd = [
+    config = (config or "").strip()
+    if _REGISTRY_PACK_RE.fullmatch(config):
+        return config
+    path = Path(config).expanduser()
+    if config.startswith("-") or "://" in config or not path.exists():
+        raise SemgrepConfigError(f"Semgrep config must be a registry pack (p/<name>) or an existing local path: {config!r}")
+    if path.is_symlink():
+        raise SemgrepConfigError(f"Semgrep config must not be a symlink: {config!r}")
+    if not (path.is_file() or path.is_dir()):
+        raise SemgrepConfigError(f"Semgrep config is not a file or directory: {config!r}")
+    return str(path.resolve())
+
+
+def build_semgrep_cmd(config: str) -> list[str]:
+    return [
         "semgrep",
         "scan",
-        "--config", "auto",
+        "--config", resolve_semgrep_config(config),
+        "--metrics=off",                 # L1: no telemetry
+        "--disable-version-check",       # L1: no version-check request
         "--exclude", "venv",
         "--exclude", ".venv",
         "--exclude", "node_modules",
         "--json",
-        "--quiet"
+        "--quiet",
     ]
-    
+
+
+async def run(
+    files: list[Path],
+    repo_root: Path,
+    start_id: int = 1,
+    config: str = DEFAULT_SEMGREP_CONFIG,
+) -> AgentResult:
+    """
+    Runs Semgrep on the host (trusted tool, static analysis only) and maps findings to Pydantic models.
+    """
+    findings = []
+
     try:
-        # Semgrep returns exit code 0 if perfectly clean
-        returncode, output = await run_command(cmd=cmd, cwd=repo_root, timeout=300) # Increased to 5 minutes
-    
+        cmd = build_semgrep_cmd(config)
+    except SemgrepConfigError as e:
+        return AgentResult(
+            agent=AgentType.SECURITY, findings=[], summary="Security scan not run: invalid Semgrep config.", error=str(e)
+        )
+
+    try:
+        res = await run_tool(cmd, cwd=repo_root, timeout=SEMGREP_TIMEOUT, max_output=SEMGREP_MAX_OUTPUT)
     except SubprocessError as e:
-        # Semgrep returns exit code 1 if it finds vulnerabilities, triggering this exception.
-        # The JSON output is contained inside the error message.
-        output = str(e)
-        if not output.strip().startswith("{"):
-            return AgentResult(
-                agent=AgentType.SECURITY,
-                findings=[],
-                summary="Security scan failed to execute.",
-                error=f"Semgrep execution error: {e}"
-            )
-            
+        return AgentResult(
+            agent=AgentType.SECURITY,
+            findings=[],
+            summary="Security scan failed to execute.",
+            error=f"Semgrep execution error: {e}"
+        )
+
+    # Exit 0 = clean, 1 = findings reported. Anything else is a Semgrep error.
+    if res.returncode not in (0, 1):
+        return AgentResult(
+            agent=AgentType.SECURITY,
+            findings=[],
+            summary="Security scan failed to execute.",
+            error=f"Semgrep exited with code {res.returncode}: {res.stderr.strip()[-1500:]}"
+        )
+    if res.truncated:
+        return AgentResult(
+            agent=AgentType.SECURITY,
+            findings=[],
+            summary="Security scan output was too large to parse.",
+            error=f"Semgrep output exceeded {SEMGREP_MAX_OUTPUT} bytes."
+        )
+
     try:
-        report = json.loads(output)
+        report = json.loads(res.stdout)
     except json.JSONDecodeError:
         return AgentResult(
             agent=AgentType.SECURITY,

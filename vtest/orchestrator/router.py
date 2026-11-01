@@ -1,37 +1,81 @@
-import os
+"""
+Orchestrator routing: decide which sub-agents to run.
+
+L4: the LLM's JSON is validated against a strict Pydantic model. Every
+execution flag defaults to False, values must be real booleans, and unknown
+keys are rejected. Invalid output raises StrategyValidationError, and nothing
+runs on a guess.
+
+M5: without --allow-llm-upload no Groq call is made. ``local_strategy()``
+picks the agents deterministically instead.
+"""
+
 import json
-from dotenv import load_dotenv
-from groq import Groq
 
-# Load environment variables from .env file
-load_dotenv()
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, field_validator
 
-def get_testing_strategy(context: dict) -> dict:
+from vtest.core.llm import ask
+
+MAX_REASONING_CHARS = 500
+ROUTER_MAX_TOKENS = 1024
+WEB_FRAMEWORKS = {"FastAPI", "Flask", "Django", "Next.js", "Express", "Spring Boot", "Node.js"}
+
+
+class StrategyValidationError(ValueError):
+    """The LLM's strategy did not match the TestingStrategy schema."""
+
+
+class TestingStrategy(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    run_unit: StrictBool = False
+    run_security: StrictBool = False
+    run_stress: StrictBool = False
+    reasoning: str = Field(default="")
+
+    @field_validator("reasoning")
+    @classmethod
+    def _cap_reasoning(cls, v: str) -> str:
+        # Untrusted LLM text: keep it short and single-line for display.
+        return " ".join(v.split())[:MAX_REASONING_CHARS]
+
+
+def parse_strategy(raw: str) -> TestingStrategy:
+    """Parse and strictly validate the LLM's JSON reply."""
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as e:
+        raise StrategyValidationError(f"Router reply is not valid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise StrategyValidationError("Router reply must be a JSON object")
+    try:
+        return TestingStrategy.model_validate(data)
+    except ValidationError as e:
+        problems = "; ".join(f"{'.'.join(map(str, err['loc'])) or '<root>'}: {err['msg']}" for err in e.errors())
+        raise StrategyValidationError(f"Router reply failed validation: {problems}") from e
+
+
+def get_testing_strategy(context: dict) -> TestingStrategy:
     """
-    Passes the codebase context to Groq (Llama 3) to determine 
-    which testing agents should be triggered.
+    Pass the codebase metadata (language, framework, file count; no source
+    code) to the LLM to decide which testing agents to run. Requires
+    --allow-llm-upload (enforced in vtest.core.llm.ask).
     """
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        raise ValueError("GROQ_API_KEY environment variable is missing.")
-
-    client = Groq(api_key=api_key)
-    
     prompt = f"""
     You are the Orchestrator AI for a local code testing agent.
     Analyze the following codebase context and decide which testing sub-agents to run.
-    
+
     Context:
     - Primary Language: {context.get('primary_language')}
     - Framework: {context.get('framework')}
     - Total Files: {context.get('total_files')}
-    
+
     Rules:
     - 'run_unit': true for almost all codebases with logic.
     - 'run_security': true for all codebases.
     - 'run_stress': true ONLY if the framework typically runs a web server or API (e.g., Next.js, Spring Boot, FastAPI, Node.js). False for simple scripts.
-    
-    You must respond ONLY with a valid JSON object matching this exact schema:
+
+    You must respond ONLY with a valid JSON object matching this exact schema, with no other keys:
     {{
         "run_unit": true/false,
         "run_security": true/false,
@@ -40,65 +84,29 @@ def get_testing_strategy(context: dict) -> dict:
     }}
     """
 
-    # Call Llama 3 via Groq API
-    response = client.chat.completions.create(
-        model="openai/gpt-oss-20b",
-        messages=[{"role": "user", "content": prompt}],
+    raw = ask(
+        prompt,
+        temperature=0.1,
+        max_tokens=ROUTER_MAX_TOKENS,
         response_format={"type": "json_object"},
-        temperature=0.1
     )
-    
-    return json.loads(response.choices[0].message.content)
+    return parse_strategy(raw)
 
-# import os
-# import json
-# from dotenv import load_dotenv
-# from google import genai
-# from google.genai import types
 
-# # Load environment variables from .env file
-# load_dotenv()
-
-# def get_testing_strategy(context: dict) -> dict:
-#     """
-#     Passes the codebase context to Gemini 2.0 Flash to determine 
-#     which testing agents should be triggered.
-#     """
-#     api_key = os.environ.get("GEMINI_API_KEY")
-#     if not api_key:
-#         raise ValueError("GEMINI_API_KEY environment variable is missing.")
-
-#     client = genai.Client(api_key=api_key)
-    
-#     prompt = f"""
-#     You are the Orchestrator AI for a local code testing agent.
-#     Analyze the following codebase context and decide which testing sub-agents to run.
-    
-#     Context:
-#     - Primary Language: {context.get('primary_language')}
-#     - Framework: {context.get('framework')}
-#     - Total Files: {context.get('total_files')}
-    
-#     Rules:
-#     - 'unit': True for almost all codebases with logic.
-#     - 'security': True for all codebases.
-#     - 'stress': True ONLY if the framework typically runs a web server or API (e.g., Next.js, Spring Boot, FastAPI, Node.js). False for simple scripts or unknown frameworks.
-#     """
-
-#     # We force Gemini to reply strictly with a JSON object 
-#     # matching this schema so our CLI doesn't break trying to parse it.
-#     response = client.models.generate_content(
-#         model='gemini-2.0-flash',
-#         contents=prompt,
-#         config=types.GenerateContentConfig(
-#             response_mime_type="application/json",
-#             response_schema={"type": "OBJECT", "properties": {
-#                 "run_unit": {"type": "BOOLEAN"},
-#                 "run_security": {"type": "BOOLEAN"},
-#                 "run_stress": {"type": "BOOLEAN"},
-#                 "reasoning": {"type": "STRING"}
-#             }}
-#         ),
-#     )
-    
-#     return json.loads(response.text)
+def local_strategy(context: dict, app_cmd_given: bool) -> TestingStrategy:
+    """
+    Deterministic strategy used when LLM upload is not allowed. Unit tests need
+    the LLM to write them, so they're off. Security (local Semgrep) is on.
+    Stress runs only for web frameworks when the user supplied --app-cmd.
+    """
+    stress = bool(app_cmd_given and context.get("framework") in WEB_FRAMEWORKS)
+    return TestingStrategy(
+        run_unit=False,
+        run_security=True,
+        run_stress=stress,
+        reasoning=(
+            "LLM upload not allowed: no data sent to Groq. Running local static analysis"
+            + (" and the sandboxed stress test." if stress else ".")
+            + " Pass --allow-llm-upload to enable LLM-generated unit tests."
+        ),
+    )

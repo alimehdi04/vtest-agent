@@ -18,3 +18,10 @@ dependencies = [
 
 [project.scripts]
 vtest = "vtest.main:app"
+
+[tool.setuptools.packages.find]
+include = ["vtest*"]
+
+# Sandbox assets: Containerfiles, the pinned pytest requirements and the fixed k6 template.
+[tool.setuptools.package-data]
+"vtest.sandbox" = ["*.Containerfile", "*.js", "*.txt"]
