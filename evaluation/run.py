@@ -115,13 +115,19 @@ def sample_card(meta: dict, data: dict) -> str:
         lines += [f"## Unit agent", "",
                   f"- Files attempted: {u['files_attempted']}; runnable tests: **{u['files_with_runnable_tests']}**; "
                   f"collection errors: {u['collection_errors']}; not run (LLM/rate limit/no code): {u['files_not_run']}",
-                  f"- Labelled files flagged with failing tests: **{u['labelled_files_flagged']}/{u['labelled_files']}** "
-                  f"(not verified: a failing test may be a wrong test)",
-                  f"- Unlabelled files flagged: {u['unlabelled_files_flagged']}/{u['unlabelled_files']}", "",
-                  "| File | Label | Outcome | Passed | Failed | Errors | First error |", "|---|---|---|---|---|---|---|"]
+                  f"- Files with failing tests: {u.get('files_with_failing_tests', '–')} → reported after review: "
+                  f"labelled **{u['labelled_files_flagged']}/{u['labelled_files']}**, "
+                  f"unlabelled **{u['unlabelled_files_flagged']}/{u['unlabelled_files']}** (lower is better)",
+                  f"- Agent: {u['agent_summary']}", "",
+                  "| File | Label | Outcome | Passed | Failed | Discarded | Reviewed | Confirmed | Reported | First error |",
+                  "|---|---|---|---|---|---|---|---|---|---|"]
         for r in u["files"]:
             lines.append(f"| {r['file']} | {r['label']} | {r['state']} | {r.get('passed', '')} | {r.get('failed', '')} | "
-                         f"{r.get('errors', '')} | {r.get('first_error', '').replace('|', '/')} |")
+                         f"{r.get('discarded_test_errors', '')} | {r.get('reviewed', '')} | {r.get('confirmed_defects', '')} | "
+                         f"{'✓' if r.get('reported') else ''} | {r.get('first_error', '').replace('|', '/')[:90]} |")
+        if u.get("findings"):
+            lines += ["", "Reported findings (check the reasons by hand):", ""]
+            lines += [f"- **{f['file']}**: {f['title']}: {f['description'][:400]}" for f in u["findings"]]
         lines.append("")
     st = data.get("stress")
     if st:

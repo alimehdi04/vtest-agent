@@ -82,24 +82,27 @@ async def unit(root: Path, gt: dict) -> dict:
     allow_uploads(True)
     unit_agent.CACHE_ENABLED = False          # measure fresh LLM generation, not cached tests
     outcomes: dict[str, dict] = {}
-    original = unit_agent._parse_pytest_output
+    original = unit_agent._review
 
-    def recording_parser(output, file_path, issue_id):
-        outcomes[Path(file_path).name] = _classify(output)
-        return original(output, file_path, issue_id)
+    async def recording_review(rel_path, output, *args, **kwargs):
+        outcome = await original(rel_path, output, *args, **kwargs)
+        outcomes[Path(rel_path).name] = {**_classify(output), **{k: outcome.stats.get(k, 0) for k in
+                                         ("discarded_test_errors", "reviewed", "confirmed_defects")},
+                                         "reported": bool(outcome.findings)}
+        return outcome
 
-    unit_agent._parse_pytest_output = recording_parser
+    unit_agent._review = recording_review
     try:
         files = [root / f for f in gt["py_files"]]
         result = await unit_agent.run(files=files, repo_root=root)
     finally:
-        unit_agent._parse_pytest_output = original
+        unit_agent._review = original
 
     attempted = [f for f in gt["py_files"] if "test" not in f.lower()]
     defect_files = {d["file"]: d["kind"] for d in gt["defects"]} | {v["file"]: "security" for v in gt["vulnerabilities"]}
     rows = []
     for f in attempted:
-        o = outcomes.get(f, {"state": "not_run (LLM error or no usable code)"})
+        o = outcomes.get(f, {"state": "not_run (LLM error or no usable code)", "reported": False})
         rows.append({"file": f, "label": defect_files.get(f, "ambiguous" if f in AMBIGUOUS else "none"), **o})
     usable = [r for r in rows if r["state"] in ("all_passed", "failing_tests")]
     positives = [r for r in rows if r["label"] not in ("none", "ambiguous")]
@@ -109,11 +112,14 @@ async def unit(root: Path, gt: dict) -> dict:
         "files_with_runnable_tests": len(usable),
         "files_not_run": sum(r["state"].startswith("not_run") for r in rows),
         "collection_errors": sum(r["state"] == "collection_error" for r in rows),
-        "labelled_files_flagged": sum(r["state"] == "failing_tests" for r in positives),
+        "files_with_failing_tests": sum(r["state"] == "failing_tests" for r in rows),
+        # A file counts as flagged only when the agent reported a finding for it (after review).
+        "labelled_files_flagged": sum(r["reported"] for r in positives),
         "labelled_files": len(positives),
-        "unlabelled_files_flagged": sum(r["state"] == "failing_tests" for r in negatives),
+        "unlabelled_files_flagged": sum(r["reported"] for r in negatives),
         "unlabelled_files": len(negatives),
         "agent_summary": result.summary,
+        "findings": [{"file": f.file_path, "title": f.title, "description": f.description} for f in result.findings],
         "agent_errors": (result.error or "")[:1500],
         "files": rows,
     }

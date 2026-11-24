@@ -157,8 +157,9 @@ def analyze(
     ),
     allow_llm_upload: bool = typer.Option(
         False, "--allow-llm-upload",
-        help="Consent to sending code skeletons (signatures + docstrings, secrets redacted) and repo "
-             "metadata to the Groq API. Without it, no data is sent and LLM unit tests are skipped.",
+        help="Consent to sending code skeletons (signatures + docstrings), the source of functions involved "
+             "in failing generated tests (secrets redacted, both), and repo metadata to the Groq API. "
+             "Without it, no data is sent and LLM unit tests are skipped.",
     ),
     semgrep_config: str = typer.Option(
         DEFAULT_SEMGREP_CONFIG, "--semgrep-config",

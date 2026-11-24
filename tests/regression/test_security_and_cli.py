@@ -126,7 +126,7 @@ CREDS_TEST = '''import inspect, module_to_test as m
 def test_real_secret_in_sandbox():
     assert "S3cretPassw0rd" in inspect.signature(m.connect).parameters["url"].default
 def test_force_finding():
-    assert False
+    assert m.connect()[1] == "something else"
 '''
 
 
@@ -136,6 +136,9 @@ def test_full_run_with_consent_redacts_prompts_and_tests_real_code(tmp_path, fak
     repo = make_project(tmp_path / "repo", {"creds.py": CREDS, "ping.py": VULNERABLE})
 
     def respond(request):
+        if "You review failing unit tests" in request["messages"][0]["content"]:
+            return ('{"verdicts": [{"test": "test_force_finding", "verdict": "code_defect", "reason": "x", '
+                    '"evidence": "return url, token"}]}')
         if request.get("response_format"):
             return '{"run_unit": true, "run_security": true, "run_stress": false, "reasoning": "ok"}'
         if "labelled 'creds.py'" in request["messages"][-1]["content"]:

@@ -59,9 +59,10 @@ vtest **fails closed**: if neither Podman nor Docker is available, or the runtim
 
 * **Routing call:** language, framework and file count only. No source code.
 * **Unit-test generation:** for each Python file (up to 50), function/class signatures and docstrings. If a file can't be parsed, its first 3,000 characters are sent instead.
+* **Failure review:** when generated tests fail, vtest first discards failures caused by the test itself (wrong arguments, broken test code). For the remaining failures it sends the failing tests, their error messages and the source of the project functions involved (up to 6,000 characters), so the model can judge whether the code or the test is wrong. Only failures judged to be real code defects are reported.
 * Before sending, a regex scrubber redacts apparent credentials: private keys, AWS/GitHub/GitLab/Slack/Groq/OpenAI/Anthropic/Stripe/Google keys, JWTs, passwords in URLs, and quoted values assigned to names like `password`, `secret`, `token` or `api_key`. Redaction is best-effort: an unusual secret format can still get through.
 * Repository content is wrapped in unguessable delimiters and the model is told to treat it as data, never instructions.
-* Each request is capped at 4,096 output tokens (1,024 for routing), with a 60-second timeout and at most 2 retries. The routing reply must match a strict schema, or the run stops.
+* Each request is capped at 4,096 output tokens (1,500 for failure review, 1,024 for routing), with a 60-second timeout and at most 2 retries. The routing reply must match a strict schema, or the run stops.
 
 Without `--allow-llm-upload`, vtest makes **no** Groq requests: it runs Semgrep, and the stress test if you give `--app-cmd` for a web framework. LLM-generated unit tests are skipped.
 
@@ -142,7 +143,7 @@ vtest stress . --install-deps --app-cmd "python3 app.py" --port 5000
 |---|---|
 | `vtest sandbox-build` | Builds the pytest and k6 sandbox images. Run once before using the Unit or Stress agents. |
 | `vtest analyze PATH` | Runs the full suite. Without `--allow-llm-upload`, makes no LLM calls. |
-| `--allow-llm-upload` | Consent to sending redacted code skeletons and repo metadata to the Groq API. Required for LLM routing and LLM-generated unit tests. Off by default. |
+| `--allow-llm-upload` | Consent to sending redacted code skeletons, the redacted source of functions involved in failing generated tests, and repo metadata to the Groq API. Required for LLM routing and LLM-generated unit tests. Off by default. |
 | `--app-cmd "CMD"` | Command that starts the target app **inside the sandbox** (e.g. `"python3 -m uvicorn main:app --port 3000"`). Required for stress testing. |
 | `--port N` | Port the app listens on inside the sandbox (default 3000). |
 | `--install-deps` | Builds a sandbox image with the repo's root `requirements.txt`, using **wheels only** (`pip --only-binary=:all:`), so no package setup scripts run. Lines with `-r`, `-e`, index URLs, direct URLs or local paths are ignored. If the build fails (e.g. a package has no wheel), vtest falls back to the base image. |
