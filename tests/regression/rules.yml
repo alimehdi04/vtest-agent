@@ -1,0 +1,11 @@
+# Minimal offline Semgrep ruleset for the regression suite.
+rules:
+  - id: regression-subprocess-shell-true
+    languages: [python]
+    severity: ERROR
+    message: subprocess called with shell=True
+    metadata:
+      cwe: ["CWE-78: Improper Neutralization of Special Elements used in an OS Command"]
+      confidence: HIGH
+      subcategory: [vuln]
+    pattern: subprocess.$FUNC(..., shell=True, ...)

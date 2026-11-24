@@ -162,6 +162,17 @@ Upon completion, `vtest` renders a color-coded Rich matrix in your terminal and 
 
 **The Handoff:** Review `fix-brief.md`, then feed it into Claude Code, Cursor, or your preferred agentic CLI to patch the identified security and logic flaws.
 
+## 🧪 Development
+
+Run the regression suite (security properties, sandbox isolation, report hardening, CLI behaviour):
+
+```bash
+pip install -e ".[dev]"
+python3 -m pytest
+```
+
+Tests marked `sandbox` need Podman/Docker and `vtest sandbox-build`; tests marked `semgrep` need Semgrep. They are skipped automatically when those are missing. No test calls the Groq API.
+
 ## ⚠️ Known Limitations
 
 * The sandbox shares the host kernel. A kernel exploit could escape it; for stronger isolation, consider gVisor or a VM.
