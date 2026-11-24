@@ -81,6 +81,12 @@ SEMGREP_TIMEOUT = 300
 # pack: its rules are still downloaded from semgrep.dev, but no telemetry is sent.
 # For a fully offline scan, pass a vendored rules file or directory (--semgrep-config).
 DEFAULT_SEMGREP_CONFIG = "p/owasp-top-ten"
+
+# vtest's own rule pack (taint rules for Flask-style request handling, weak randomness,
+# weak hashes by name, insecure cookies). Local, so it also works offline; always run
+# alongside the configured ruleset unless INCLUDE_VTEST_RULES is turned off.
+VTEST_RULES = Path(__file__).resolve().parent.parent / "rules" / "python-web.yml"
+INCLUDE_VTEST_RULES = True
 _REGISTRY_PACK_RE = re.compile(r"^p/[a-z0-9][a-z0-9-]{0,63}$")
 
 
@@ -128,10 +134,12 @@ def collect_targets(repo_root: Path) -> list[str]:
 
 
 def build_semgrep_cmd(config: str, targets: list[str] | None = None) -> list[str]:
+    extra = ["--config", str(VTEST_RULES)] if INCLUDE_VTEST_RULES else []
     return [
         "semgrep",
         "scan",
         "--config", resolve_semgrep_config(config),
+        *extra,
         "--metrics=off",                 # L1: no telemetry
         "--disable-version-check",       # L1: no version-check request
         "--exclude", "venv",
@@ -238,17 +246,23 @@ async def run(
 
     issue_id = start_id
     for issue in semgrep_findings:
+        metadata = issue.get("extra", {}).get("metadata", {})
+        subcategory = metadata.get("subcategory", [])
+        # "audit" rules flag risky APIs without evidence that untrusted data reaches them
+        # (e.g. any eval(), any XML parser). Report them as hygiene, at low severity.
+        hygiene = "audit" in (subcategory if isinstance(subcategory, list) else [subcategory])
+        severity = map_severity(issue.get("extra", {}).get("severity", "INFO"))
         finding = Finding(
             id=f"{issue_id:02d}",
             title=issue.get("check_id", "Vulnerability Detected"),
             description=issue.get("extra", {}).get("message", "No description provided."),
-            severity=map_severity(issue.get("extra", {}).get("severity", "INFO")),
+            severity=Severity.LOW if hygiene and severity in (Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM) else severity,
             agent=AgentType.SECURITY,
             file_path=issue.get("path", "Unknown"),
             line=issue.get("start", {}).get("line"),
-            category=["Security"],
+            category=["Security", "Hygiene"] if hygiene else ["Security"],
             log=json.dumps(issue, indent=2),
-            fix_hint=issue.get("extra", {}).get("metadata", {}).get("shortlink", "")
+            fix_hint=metadata.get("shortlink", "")
         )
         findings.append(finding)
         issue_id += 1

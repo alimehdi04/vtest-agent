@@ -21,7 +21,7 @@ It orchestrates three specialized sub-agents in parallel to assess code quality 
 * **Core/CLI:** Python 3.10+, Typer, Rich
 * **Sandbox:** Podman (rootless, recommended) or Docker
 * **LLM Engine:** Groq API (`openai/gpt-oss-20b`), opt-in
-* **Static Analysis:** Semgrep OSS (`p/owasp-top-ten` by default, or a local ruleset)
+* **Static Analysis:** Semgrep OSS (`p/owasp-top-ten` by default, or a local ruleset) plus vtest's own rule pack (`vtest/rules/python-web.yml`)
 * **Performance Testing:** k6 (runs inside the sandbox)
 * **Data Validation:** Pydantic
 * **Graphing & Context:** NetworkX, Pathspec
@@ -162,6 +162,28 @@ Upon completion, `vtest` renders a color-coded Rich matrix in your terminal and 
 2. **`fix-brief.md`**: A machine-readable `<vibe_audit>` XML prompt containing execution traces, locations, and rule violations. Untrusted content is escaped and labelled `trust="untrusted"`.
 
 **The Handoff:** Review `fix-brief.md`, then feed it into Claude Code, Cursor, or your preferred agentic CLI to patch the identified security and logic flaws.
+
+## 🎯 Detection Quality
+
+The Security agent runs the configured Semgrep ruleset together with vtest's own rule pack, [`vtest/rules/python-web.yml`](vtest/rules/python-web.yml). The pack is local, so it also works offline. It holds 13 rules, each tagged with its CWE:
+
+* **Taint rules for web request data:** path traversal, XSS, command, SQL, LDAP and XPath injection, trust boundary, open redirect, code injection and unsafe deserialization. They recognise common sanitizers and early-return validation checks.
+* **Pattern rules:** non-cryptographic randomness used for sessions, cookies or secrets; `hashlib.new()` with a weak algorithm; cookies set with `secure=False`.
+
+Findings from Semgrep *audit* rules flag a risky API without evidence that untrusted data reaches it, such as any `eval()` or any XML parser. They're reported as **Hygiene** at low severity.
+
+**Measured on the OWASP Benchmark for Python** (`python3 -m evaluation.run owasp`): the rules were written using 710 cases, and the score below comes from 520 held-out cases that were never used for development. A finding counts only if its CWE matches the case's weakness:
+
+| | Registry ruleset only | + vtest rule pack |
+|---|---|---|
+| Recall | 15.1% | 67.6% |
+| False-positive rate | 0.6% | 9.7% |
+| Score (recall − FPR; 0 = random) | +14.5 | **+57.9** |
+
+**Known limits:**
+* Weak randomness, weak hashes and insecure cookies are detected reliably. Path traversal, XPath and LDAP injection remain weak.
+* Semgrep's free taint engine doesn't carry taint through Python slices (`value[4:-17]`) or across files, and it can lose taint in dicts written with several constant keys.
+* Like any analysis that doesn't evaluate branches, the rules can't tell when a constant condition makes a data flow unreachable.
 
 ## 🧪 Development
 

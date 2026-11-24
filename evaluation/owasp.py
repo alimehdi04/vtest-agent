@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import collections
 import csv
+import hashlib
 import json
 import re
 import xml.etree.ElementTree as ET
@@ -34,6 +35,22 @@ def load_cases(bench_dir: Path) -> dict[str, dict]:
 def load_tune_ids(manifest: Path) -> set[str]:
     with manifest.open(encoding="utf-8") as fh:
         return {row["case_id"] for row in csv.DictReader(fh)}
+
+
+def split_heldout(cases: dict[str, dict], heldout: set[str]) -> tuple[set[str], set[str]]:
+    """
+    Split held-out cases 50/50 into (dev, test), stratified by category and label, using a
+    fixed hash so the split never changes. Write and tune rules on tune + dev only; report test.
+    """
+    groups = collections.defaultdict(list)
+    for cid in heldout:
+        groups[(cases[cid]["category"], cases[cid]["vulnerable"])].append(cid)
+    dev, test = set(), set()
+    for ids in groups.values():
+        ids.sort(key=lambda c: hashlib.sha256(f"vtest-owasp-split-v1:{c}".encode()).hexdigest())
+        for i, cid in enumerate(ids):
+            (dev if i % 2 == 0 else test).add(cid)
+    return dev, test
 
 
 def _hit(case_id: str, issue: dict) -> dict:

@@ -68,26 +68,28 @@ def _overall_rows(split: str, res: dict) -> list[str]:
 def owasp_card(meta: dict, data: dict) -> str:
     lines = [f"# vtest scorecard: OWASP Benchmark Python (Security agent)", "",
              f"- Commit `{meta['vtest_commit'][:10]}`{' (+ uncommitted changes)' if meta['vtest_tracked_changes'] else ''}, "
-             f"Semgrep {meta['semgrep_version'][0]}, rules `{Path(meta['semgrep_config']).name}`",
+             f"Semgrep {meta['semgrep_version'][0]}, rules `{Path(meta['semgrep_config']).name}`"
+             f"{' + vtest rule pack' if meta.get('vtest_rules') else ' only (no vtest rule pack)'}",
              f"- Score = recall − FPR (Youden; 0 = random guessing). Modes: `file` = any finding on the case file; "
              f"`cwe` = finding's CWE in the case's CWE family; `cwe-strict` = exact CWE.",
-             f"- Report the **heldout** split. `tune` was already used for diagnosis.", "",
+             f"- Report the **test** split (525 held-out cases never used for rule writing). "
+             f"`dev` (525) and `tune` (180) are used to develop rules.", "",
              "| Split | Mode | n | TP | FP | TN | FN | Recall (95% CI) | FPR (95% CI) | Precision | Score |",
              "|---|---|---|---|---|---|---|---|---|---|---|"]
-    for split in ("heldout", "tune"):
+    for split in ("test", "dev", "tune"):
         lines += _overall_rows(split, data[split])
-    lines += ["", "## Held-out split by category", "",
+    lines += ["", "## Test split by category", "",
               "| Category | CWE | Vulnerable | Safe | Recall (file) | FPR (file) | Score (file) | Recall (cwe) | FPR (cwe) | Score (cwe) |",
               "|---|---|---|---|---|---|---|---|---|---|"]
-    for cat, r in data["heldout"]["per_category"].items():
+    for cat, r in data["test"]["per_category"].items():
         f, c = r["file"], r["cwe"]
         lines.append(f"| {cat} | {r['cwe_id']} | {f['TP'] + f['FN']} | {f['FP'] + f['TN']} | {pct(f['recall'])} | "
                      f"{pct(f['false_positive_rate'])} | {pts(f['youden'])} | {pct(c['recall'])} | "
                      f"{pct(c['false_positive_rate'])} | **{pts(c['youden'])}** |")
-    lines += ["", "## Held-out split: rules by how well they separate vulnerable from safe cases", "",
+    lines += ["", "## Test split: rules by how well they separate vulnerable from safe cases", "",
               "| Rule | Confidence | Subcategory | Vulnerable cases hit | Safe cases hit | Score |",
               "|---|---|---|---|---|---|"]
-    for r in data["heldout"]["rules"][:20]:
+    for r in data["test"]["rules"][:25]:
         lines.append(f"| {r['rule']} | {r['confidence']} | {r['subcategory']} | {r['vulnerable_hits']} | "
                      f"{r['safe_hits']} | {pts(r['youden'])} |")
     lines += ["", f"Scan: {data['scan']['summary']} Elapsed {data['elapsed_seconds']:.0f}s."]
@@ -162,12 +164,13 @@ def staged_copy(src: Path, tmp: str) -> Path:
 async def run_owasp(args) -> dict:
     cases = owasp.load_cases(BENCH)
     tune = owasp.load_tune_ids(MANIFEST)
-    heldout = set(cases) - tune
+    dev, test = owasp.split_heldout(cases, set(cases) - tune)
     t0 = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="vtest-eval-") as tmp:
         hits, scan = await owasp.run_security_agent(staged_copy(BENCH / "testcode", tmp), args.config, args.timeout)
     return {"scan": scan, "elapsed_seconds": time.perf_counter() - t0,
-            "tune": owasp.score(cases, hits, tune), "heldout": owasp.score(cases, hits, heldout),
+            "test": owasp.score(cases, hits, test), "dev": owasp.score(cases, hits, dev),
+            "tune": owasp.score(cases, hits, tune),
             "hits": hits}
 
 
@@ -193,10 +196,15 @@ def main() -> None:
     p.add_argument("--timeout", type=int, default=1800, help="Semgrep timeout in seconds (owasp)")
     p.add_argument("--agents", default="security,unit,stress", help="sample suite: comma-separated agents")
     p.add_argument("--out", default=str(ROOT / "evaluation/results"))
+    p.add_argument("--without-vtest-rules", action="store_true",
+                   help="Scan with the --config ruleset only (baseline without vtest's rule pack)")
     args = p.parse_args()
     args.agents = set(args.agents.split(","))
+    from vtest.agents import security_agent
+    security_agent.INCLUDE_VTEST_RULES = not args.without_vtest_rules
 
     meta = metadata(args.suite, args.config)
+    meta["vtest_rules"] = None if args.without_vtest_rules else hashlib.sha256(security_agent.VTEST_RULES.read_bytes()).hexdigest()
     t0 = time.perf_counter()
     if args.suite == "owasp":
         data = asyncio.run(run_owasp(args))
