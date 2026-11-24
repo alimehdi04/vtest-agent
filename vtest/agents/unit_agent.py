@@ -8,8 +8,10 @@ Pipeline:
   2. Send it to the LLM wrapped in unguessable XML-style delimiters and
      explicitly marked as untrusted data, never instructions (H1).
   3. Clean the LLM's pytest suite.
-  4. Run the repository file + generated tests inside the container sandbox
-     (no network, no capabilities, unprivileged, read-only, PID/memory limits).
+  4. Run the generated tests inside the container sandbox against the whole
+     project tree, so the module's own imports work (no network, no
+     capabilities, unprivileged, read-only, PID/memory limits). Generated tests
+     are cached by prompt content, so re-runs don't call the LLM again.
      At most SANDBOX_CONCURRENCY files are processed at once (C1, M4).
   5. Parse pytest output into typed Finding objects.
 
@@ -18,18 +20,25 @@ Everything that comes back from the sandbox is untrusted data.
 
 import ast
 import asyncio
+import hashlib
+import json
+import keyword
+import os
 import re
 import secrets
+import stat
+import tempfile
 from pathlib import Path
 
-from vtest.core.llm import ask, uploads_allowed
+from vtest.core.llm import MODEL, ask, uploads_allowed
 from vtest.core.models import AgentResult, AgentType, Finding, Severity
 from vtest.core.runner import (
     PYTEST_IMAGE,
     SandboxPolicy,
     SandboxUnavailable,
     SubprocessError,
-    make_tar,
+    append_to_tar,
+    make_tree_tar,
     run_sandboxed,
 )
 
@@ -38,6 +47,9 @@ MAX_FILE_BYTES = 40_000
 SANDBOX_CONCURRENCY = 4
 SANDBOX_TIMEOUT = 90
 LLM_MAX_TOKENS = 4096
+UNIT_TREE_MAX_BYTES = 64 * 1024 * 1024   # project tree sent to each unit sandbox
+PROMPT_VERSION = 1                       # bump when the prompt changes, to invalidate cached tests
+CACHE_ENABLED = True
 
 
 # ── M5: secret scrubbing for LLM-bound text ─────────────────────────────────
@@ -204,6 +216,66 @@ def _build_prompts(skeleton: str, filename: str) -> tuple[str, str]:
     return system, prompt
 
 
+# ── Generated-test cache ────────────────────────────────────────────────────
+# Keyed by everything that determines the prompt (not the per-request nonce).
+# Holds only LLM output for redacted skeletons. Entries must be regular files
+# owned by this user and not group/world-writable, or they are ignored.
+
+def _cache_dir() -> Path:
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "vtest" / "unit-tests"
+
+
+def _cache_key(skeleton: str, filename: str) -> str:
+    material = json.dumps([PROMPT_VERSION, MODEL, LLM_MAX_TOKENS, filename, skeleton])
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
+def _cache_read(key: str) -> str | None:
+    if not CACHE_ENABLED:
+        return None
+    try:
+        fd = os.open(_cache_dir() / f"{key}.py", os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8", closefd=False) as fh:
+            return fh.read()
+    finally:
+        os.close(fd)
+
+
+def _cache_write(key: str, code: str) -> None:
+    if not CACHE_ENABLED:
+        return
+    directory = _cache_dir()
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.NamedTemporaryFile("w", dir=directory, suffix=".tmp", delete=False, encoding="utf-8") as fh:
+            fh.write(code)
+        os.replace(fh.name, directory / f"{key}.py")
+    except OSError:
+        pass                                    # caching is best effort
+
+
+def _import_shim(rel_path: str) -> str:
+    """module_to_test.py: makes `import module_to_test` load the real module from the project tree."""
+    parts = list(Path(rel_path).with_suffix("").parts)
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    if parts and all(p.isidentifier() and not keyword.iskeyword(p) for p in parts):
+        return ("import importlib, sys\n"
+                f"sys.modules[__name__] = importlib.import_module({'.'.join(parts)!r})\n")
+    # Path isn't importable by name (e.g. a hyphenated directory): load the file directly.
+    return ("import importlib.util, sys\n"
+            f"_spec = importlib.util.spec_from_file_location(__name__, {'/work/' + Path(rel_path).as_posix()!r})\n"
+            "_mod = importlib.util.module_from_spec(_spec)\n"
+            "sys.modules[__name__] = _mod\n"
+            "_spec.loader.exec_module(_mod)\n")
+
+
 def _generate_tests(skeleton: str, filename: str) -> str:
     """Ask the LLM to write a pytest suite for the given (untrusted, already redacted) code skeleton."""
     system, prompt = _build_prompts(skeleton, filename)
@@ -272,6 +344,7 @@ async def _run_tests_for_file(
     repo_root: Path,
     issue_counter: list[int],
     semaphore: asyncio.Semaphore,
+    tree: bytes,
     image: str = PYTEST_IMAGE,
     redaction_counter: list[int] | None = None,
 ) -> Finding | None:
@@ -291,35 +364,28 @@ async def _run_tests_for_file(
         skeleton, redacted = redact_secrets(_extract_skeleton(source))
         if redaction_counter is not None:
             redaction_counter[0] += redacted
-        # The LLM client is synchronous; run it in a thread so it doesn't block the event loop.
-        raw_tests = await asyncio.to_thread(_generate_tests, skeleton, source_file.name)
-        test_code = _clean_llm_code(raw_tests)
+        key = _cache_key(skeleton, source_file.name)
+        test_code = _cache_read(key)
+        if test_code is None:
+            # The LLM client is synchronous; run it in a thread so it doesn't block the event loop.
+            raw_tests = await asyncio.to_thread(_generate_tests, skeleton, source_file.name)
+            test_code = _clean_llm_code(raw_tests)
+            if not test_code or "import" not in test_code:
+                return None
+            _cache_write(key, test_code)
 
-        if not test_code or "import" not in test_code:
-            return None
-
-        payload = make_tar({"module_to_test.py": source, "test_generated.py": test_code})
+        payload = append_to_tar(tree, {"module_to_test.py": _import_shim(rel_path), "test_generated.py": test_code})
         try:
             res = await run_sandboxed(
-                SandboxPolicy(image=image),
+                SandboxPolicy(image=image, workdir_size="128m"),
                 stdin_data=payload,
                 timeout=SANDBOX_TIMEOUT,
             )
         except SandboxUnavailable:
             raise                                      # fail closed: never fall back to the host
         except SubprocessError as e:
-            return Finding(
-                id=f"{issue_counter[0]:02d}",
-                title=f"Unit agent sandbox error — {source_file.name}",
-                description=str(e),
-                severity=Severity.INFO,
-                agent=AgentType.UNIT,
-                file_path=rel_path,
-                line=None,
-                category=["Unit test"],
-                log=str(e),
-                fix_hint="",
-            )
+            # The tests never ran: an incomplete run, not a finding about the code.
+            raise SubprocessError(f"{rel_path}: sandbox error: {e}") from e
 
     issue_id = f"{issue_counter[0]:02d}"
     finding = _parse_pytest_output(res.output, rel_path, issue_id)
@@ -365,12 +431,17 @@ async def run(
             summary="No Python source files found to test.",
         )
 
+    try:
+        tree = await asyncio.to_thread(make_tree_tar, repo_root, max_bytes=UNIT_TREE_MAX_BYTES)
+    except ValueError as e:
+        return AgentResult(agent=AgentType.UNIT, findings=[], summary="Unit tests not run.", error=str(e))
+
     issue_counter = [start_id]
     redaction_counter = [0]
     semaphore = asyncio.Semaphore(SANDBOX_CONCURRENCY)
 
     tasks = [
-        _run_tests_for_file(f, repo_root, issue_counter, semaphore, image, redaction_counter)
+        _run_tests_for_file(f, repo_root, issue_counter, semaphore, tree, image, redaction_counter)
         for f in python_files
     ]
 

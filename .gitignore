@@ -22,3 +22,5 @@ fix-brief.md
 # OS specific
 .DS_Store
 Thumbs.db
+# Evaluation harness output (machine-specific; may contain API account identifiers)
+evaluation/results/

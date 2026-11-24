@@ -36,7 +36,7 @@ vtest analyzes code it does not trust. A repository can contain hostile code, an
 |---|---|---|
 | CLI, ingestion, report writing | Host | Trusted vtest code; never executes repository code |
 | Semgrep | Host | Trusted tool; static analysis only (reads files, executes nothing) |
-| pytest + repository code + LLM-generated tests | **Sandbox** (`localhost/vtest-pytest:1`) | Executes untrusted code |
+| pytest + repository code + LLM-generated tests | **Sandbox** (`localhost/vtest-pytest:2`) | Executes untrusted code |
 | Target app (stress test) | **Sandbox** (base or `--install-deps` image) | Executes untrusted code |
 | k6 load generator | **Sandbox** (`localhost/vtest-k6:1`) | Joins only the app's isolated network |
 
@@ -97,7 +97,7 @@ pip install .
 vtest sandbox-build
 ```
 
-This builds `localhost/vtest-pytest:1` and `localhost/vtest-k6:1` from the Containerfiles in `vtest/sandbox/`. Base images are pinned by digest and pulled from Docker Hub, so this step needs network access. After that, sandbox images are never pulled automatically (`--pull=never`). vtest uses Podman when it's installed; set `VTEST_CONTAINER_RUNTIME=docker` to force Docker.
+This builds `localhost/vtest-pytest:2` and `localhost/vtest-k6:1` from the Containerfiles in `vtest/sandbox/`. Base images are pinned by digest and pulled from Docker Hub, so this step needs network access. After that, sandbox images are never pulled automatically (`--pull=never`). vtest uses Podman when it's installed; set `VTEST_CONTAINER_RUNTIME=docker` to force Docker.
 
 **Configuration (only needed for `--allow-llm-upload`):**
 

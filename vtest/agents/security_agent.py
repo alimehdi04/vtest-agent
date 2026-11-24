@@ -56,12 +56,20 @@
 #     except json.JSONDecodeError:
 #         return [{"id": "ERR", "issue": "Failed to parse Semgrep output", "severity": "High", "category": "System", "file_line": "N/A", "agent": "Security"}]
 
+import collections
 import json
+import os
 import re
 from pathlib import Path
 
+from vtest.core.ingestion import _get_pathspec
 from vtest.core.models import AgentResult, AgentType, Finding, Severity
-from vtest.core.runner import SubprocessError, run_tool
+from vtest.core.runner import TREE_SKIP_DIRS, SubprocessError, run_tool
+
+# Targets are passed to Semgrep explicitly, in chunks, so that Semgrep's built-in
+# ignore list (tests/, test/, build/, vendor/ ... relative to the git root) can't
+# silently drop files: explicitly listed files are always scanned.
+TARGET_CHUNK = 4000
 
 # Semgrep's JSON report for a large repository can be tens of MB. Semgrep is a
 # trusted host tool, so it gets a higher cap than sandboxed output (1 MB).
@@ -98,7 +106,28 @@ def resolve_semgrep_config(config: str) -> str:
     return str(path.resolve())
 
 
-def build_semgrep_cmd(config: str) -> list[str]:
+def collect_targets(repo_root: Path) -> list[str]:
+    """Regular files under repo_root (relative paths), honoring .gitignore and vtest's skip list; no symlinks."""
+    spec = _get_pathspec(repo_root)
+    targets = []
+    for root, dirs, files in os.walk(repo_root, followlinks=False):
+        rel_root = os.path.relpath(root, repo_root)
+        dirs[:] = sorted(
+            d for d in dirs
+            if d not in TREE_SKIP_DIRS
+            and not os.path.islink(os.path.join(root, d))
+            and not spec.match_file(os.path.normpath(os.path.join(rel_root, d)) + "/")
+        )
+        for name in sorted(files):
+            rel = os.path.normpath(os.path.join(rel_root, name))
+            full = os.path.join(root, name)
+            if os.path.islink(full) or not os.path.isfile(full) or spec.match_file(rel):
+                continue
+            targets.append(rel)
+    return targets
+
+
+def build_semgrep_cmd(config: str, targets: list[str] | None = None) -> list[str]:
     return [
         "semgrep",
         "scan",
@@ -110,7 +139,19 @@ def build_semgrep_cmd(config: str) -> list[str]:
         "--exclude", "node_modules",
         "--json",
         "--quiet",
+        "--",
+        *(targets or []),
     ]
+
+
+def _describe_errors(errors: list[dict]) -> str:
+    kinds = collections.Counter()
+    for e in errors:
+        kind = e.get("type")
+        kinds[kind if isinstance(kind, str) else (kind[0] if isinstance(kind, list) and kind else "error")] += 1
+    paths = sorted({p for e in errors for p in ([e.get("path")] if e.get("path") else [])})
+    shown = ", ".join(f"{n} {k}" for k, n in kinds.most_common())
+    return f"Semgrep could not fully analyze the code ({shown})" + (f"; files: {', '.join(paths[:5])}" if paths else "")
 
 
 async def run(
@@ -125,49 +166,68 @@ async def run(
     findings = []
 
     try:
-        cmd = build_semgrep_cmd(config)
+        resolve_semgrep_config(config)
     except SemgrepConfigError as e:
         return AgentResult(
             agent=AgentType.SECURITY, findings=[], summary="Security scan not run: invalid Semgrep config.", error=str(e)
         )
 
-    try:
-        res = await run_tool(cmd, cwd=repo_root, timeout=SEMGREP_TIMEOUT, max_output=SEMGREP_MAX_OUTPUT)
-    except SubprocessError as e:
-        return AgentResult(
-            agent=AgentType.SECURITY,
-            findings=[],
-            summary="Security scan failed to execute.",
-            error=f"Semgrep execution error: {e}"
-        )
+    targets = collect_targets(repo_root)
+    if not targets:
+        return AgentResult(agent=AgentType.SECURITY, findings=[], summary="Security scan: no files to scan.")
 
-    # Exit 0 = clean, 1 = findings reported. Anything else is a Semgrep error.
-    if res.returncode not in (0, 1):
-        return AgentResult(
-            agent=AgentType.SECURITY,
-            findings=[],
-            summary="Security scan failed to execute.",
-            error=f"Semgrep exited with code {res.returncode}: {res.stderr.strip()[-1500:]}"
-        )
-    if res.truncated:
-        return AgentResult(
-            agent=AgentType.SECURITY,
-            findings=[],
-            summary="Security scan output was too large to parse.",
-            error=f"Semgrep output exceeded {SEMGREP_MAX_OUTPUT} bytes."
-        )
+    semgrep_findings: list[dict] = []
+    semgrep_errors: list[dict] = []
+    scanned: set[str] = set()
+    for start in range(0, len(targets), TARGET_CHUNK):
+        cmd = build_semgrep_cmd(config, targets[start:start + TARGET_CHUNK])
+        try:
+            res = await run_tool(cmd, cwd=repo_root, timeout=SEMGREP_TIMEOUT, max_output=SEMGREP_MAX_OUTPUT)
+        except SubprocessError as e:
+            return AgentResult(
+                agent=AgentType.SECURITY,
+                findings=[],
+                summary="Security scan failed to execute.",
+                error=f"Semgrep execution error: {e}"
+            )
 
-    try:
-        report = json.loads(res.stdout)
-    except json.JSONDecodeError:
+        # Exit 0 = clean, 1 = findings reported. Anything else is a Semgrep error.
+        if res.returncode not in (0, 1):
+            return AgentResult(
+                agent=AgentType.SECURITY,
+                findings=[],
+                summary="Security scan failed to execute.",
+                error=f"Semgrep exited with code {res.returncode}: {res.stderr.strip()[-1500:]}"
+            )
+        if res.truncated:
+            return AgentResult(
+                agent=AgentType.SECURITY,
+                findings=[],
+                summary="Security scan output was too large to parse.",
+                error=f"Semgrep output exceeded {SEMGREP_MAX_OUTPUT} bytes."
+            )
+
+        try:
+            report = json.loads(res.stdout)
+        except json.JSONDecodeError:
+            return AgentResult(
+                agent=AgentType.SECURITY,
+                findings=[],
+                summary="Failed to parse Semgrep output.",
+                error="Output was not valid JSON."
+            )
+        semgrep_findings.extend(report.get("results", []))
+        semgrep_errors.extend(report.get("errors", []))
+        scanned.update(report.get("paths", {}).get("scanned", []))
+
+    # Never report a clean result for a scan that analyzed nothing.
+    if not scanned:
         return AgentResult(
             agent=AgentType.SECURITY,
             findings=[],
-            summary="Failed to parse Semgrep output.",
-            error="Output was not valid JSON."
+            summary=f"Security scan analyzed 0 of {len(targets)} file(s).",
+            error="Semgrep scanned no files (none matched the ruleset's languages, or all were skipped).",
         )
-
-    semgrep_findings = report.get("results", [])
     
     def map_severity(sg_sev: str) -> Severity:
         sg_sev = sg_sev.upper()
@@ -193,11 +253,11 @@ async def run(
         findings.append(finding)
         issue_id += 1
         
-    summary = f"Security scan complete. Found {len(findings)} issue(s)."
-    
+    summary = f"Security scan complete. Analyzed {len(scanned)} file(s). Found {len(findings)} issue(s)."
+
     return AgentResult(
         agent=AgentType.SECURITY,
         findings=findings,
         summary=summary,
-        error=None
+        error=_describe_errors(semgrep_errors) if semgrep_errors else None,
     )

@@ -225,14 +225,17 @@ def analyze(
         ))
 
         all_findings = []
+        incomplete = []            # (agent, message): agents that crashed or could not finish
         for result in agent_results:
             if isinstance(result, Exception):
                 console.print(f"   [red]Agent Crash: {escape(str(result))}[/red]")
+                incomplete.append(("Unknown", f"Agent crashed: {result}"))
                 continue
 
             console.print(f"   [dim]{escape(result.summary)}[/dim]")
             if result.error:
                 console.print(f"   [red]Errors: {escape(result.error)}[/red]")
+                incomplete.append((result.agent.value, result.error))
 
             for finding in result.findings:
                 all_findings.append({
@@ -248,7 +251,7 @@ def analyze(
 
         # 5. Report Generation (only ever inside <repo_root>/output, never through a symlink)
         try:
-            audit_file, brief_file = generate_reports(context, all_findings, repo_root)
+            audit_file, brief_file = generate_reports(context, all_findings, repo_root, incomplete=incomplete)
             console.log("[green]✓[/green] Reports synthesized")
         except OutputPathError as e:
             audit_file = brief_file = None
@@ -277,8 +280,13 @@ def analyze(
                 escape(f['issue'])
             )
         console.print(table)
-    else:
+    elif not incomplete:
         console.print("\n[bold green]✓ No issues found across all agents![/bold green]")
+
+    if incomplete:
+        agents = ", ".join(sorted({a for a, _ in incomplete}))
+        console.print(f"\n[bold yellow]⚠ Incomplete run: {escape(agents)} could not finish. "
+                      "Results are partial; see the errors above and the reports.[/bold yellow]")
 
     if audit_file is None:
         console.print("\n[bold red]Audit finished, but no report files were written (see error above).[/bold red]")
@@ -287,6 +295,8 @@ def analyze(
     console.print("\n[bold blue]Audit complete! Check your output files:[/bold blue]")
     console.print(f" 📄 {escape(audit_file)}")
     console.print(f" 🤖 {escape(brief_file)}\n")
+    if incomplete:
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -307,17 +317,19 @@ def security(
             files=source_files, repo_root=repo_root, start_id=100, config=semgrep_config,
         ))
 
+    console.print(f"[dim]{escape(result.summary)}[/dim]")
     if result.error:
-        console.print(f"[red]{escape(result.summary)} {escape(result.error)}[/red]")
-        return
-    if not result.findings:
+        console.print(f"[red]Incomplete scan: {escape(result.error)}[/red]")
+
+    if result.findings:
+        console.print(f"\n[bold red]Found {len(result.findings)} security issues:[/bold red]")
+        for f in result.findings:
+            console.print(f"[{f.severity.value}] {escape(f.file_path)}:{f.line} - {escape(f.title)}")
+    elif not result.error:
         console.print("[bold green]✓ No security issues found![/bold green]")
-        return
 
-    console.print(f"\n[bold red]Found {len(result.findings)} security issues:[/bold red]")
-
-    for f in result.findings:
-        console.print(f"[{f.severity.value}] {escape(f.file_path)}:{f.line} - {escape(f.title)}")
+    if result.error:
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -351,6 +363,8 @@ def stress(
         console.print(f"[red]Errors: {escape(result.error)}[/red]")
     for f in result.findings:
         console.print(f"[{f.severity.value}] {escape(f.title)}")
+    if result.error:
+        raise typer.Exit(code=1)
 
 
 @app.command("sandbox-build")

@@ -6,12 +6,17 @@ Groq LLM wrapper.
   Every LLM call in vtest goes through ``ask()``, so this one gate covers them all.
 * L2: every request has a strict output-token cap, a request timeout and a
   bounded retry count.
+* Rate limits: one request at a time across all threads, and HTTP 429 replies are
+  retried after the delay Groq asks for, within a bounded total wait.
 """
 
 import os
+import re
+import threading
+import time
 
 from dotenv import load_dotenv
-from groq import Groq
+from groq import Groq, RateLimitError
 
 load_dotenv()
 
@@ -19,7 +24,12 @@ MODEL = "openai/gpt-oss-20b"
 DEFAULT_MAX_TOKENS = 4096          # hard cap on completion tokens, including hidden reasoning tokens
 MAX_TOKENS_CEILING = 8192          # no caller may ask for more than this
 REQUEST_TIMEOUT_SECONDS = 60.0
-MAX_RETRIES = 2
+MAX_RETRIES = 2                    # SDK retries for connection errors / 5xx
+RATE_LIMIT_MAX_TOTAL_WAIT = 600.0  # give up after waiting this long in total for 429s
+RATE_LIMIT_MAX_SINGLE_WAIT = 60.0
+RATE_LIMIT_FALLBACK_WAIT = 5.0
+
+_llm_slot = threading.Lock()       # one in-flight request: free-tier TPM limits make parallel calls just collide
 
 _upload_allowed = False
 
@@ -81,14 +91,14 @@ def ask(
         # Reasoning tokens count against max_completion_tokens; keep them small.
         kwargs["reasoning_effort"] = "low"
 
-    response = client.chat.completions.create(
+    response = _create_with_rate_limit_retry(client, dict(
         model=MODEL,
         messages=messages,
         temperature=temperature,
         max_completion_tokens=max_tokens,
         timeout=REQUEST_TIMEOUT_SECONDS,
         **kwargs,
-    )
+    ))
 
     choice = response.choices[0]
     content = choice.message.content or ""
@@ -97,3 +107,31 @@ def ask(
     if not content.strip():
         raise LLMResponseError("LLM returned an empty reply")
     return content
+
+
+def _retry_delay(err: RateLimitError) -> float:
+    """Seconds Groq asks us to wait: retry-after header, else 'try again in 1m2.5s / 600ms'."""
+    headers = getattr(getattr(err, "response", None), "headers", None) or {}
+    try:
+        return float(headers.get("retry-after"))
+    except (TypeError, ValueError):
+        pass
+    m = re.search(r"try again in (?:(\d+)m)?([\d.]+)(ms|s)", str(err))
+    if m:
+        minutes, value, unit = m.groups()
+        return int(minutes or 0) * 60 + float(value) / (1000 if unit == "ms" else 1)
+    return RATE_LIMIT_FALLBACK_WAIT
+
+
+def _create_with_rate_limit_retry(client, request: dict):
+    waited = 0.0
+    with _llm_slot:
+        while True:
+            try:
+                return client.chat.completions.create(**request)
+            except RateLimitError as err:
+                delay = min(max(_retry_delay(err), 0.1) + 0.25, RATE_LIMIT_MAX_SINGLE_WAIT)
+                if waited + delay > RATE_LIMIT_MAX_TOTAL_WAIT:
+                    raise
+                time.sleep(delay)
+                waited += delay
