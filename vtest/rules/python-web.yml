@@ -1,0 +1,350 @@
+# vtest rule pack: Python web-application vulnerabilities (Flask-style request handling).
+#
+# Complements the registry ruleset vtest runs by default. Each rule carries its CWE so
+# findings can be scored per weakness. Taint rules treat everything read from the request
+# as untrusted, including through helper functions and wrapper objects.
+#
+# Developed against the OWASP Benchmark for Python "tune" and "dev" splits only; the
+# held-out "test" split is used to measure it (see evaluation/).
+
+x-sources: &request_sources
+  # The request object itself, so data read through helpers/wrappers (wrapper(request).get(...)) is tainted too.
+  - pattern: flask.request
+
+x-sanitizers: &generic_sanitizers
+  - pattern: int(...)
+  - pattern: float(...)
+  - pattern: bool(...)
+  - pattern: len(...)
+  - pattern: $W.get_safe_value(...)
+
+x-meta: &meta
+  category: security
+  subcategory: [vuln]
+  technology: [python, flask]
+  source: vtest
+
+rules:
+  # ── CWE-22 path traversal ──────────────────────────────────────────────
+  - id: vtest-path-traversal
+    mode: taint
+    languages: [python]
+    severity: ERROR
+    message: Request data is used in a file path. Resolve the path and check it stays inside the intended directory.
+    metadata:
+      <<: *meta
+      cwe: ["CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"]
+      confidence: MEDIUM
+    pattern-sources: *request_sources
+    pattern-sanitizers:
+      - pattern: int(...)
+      - pattern: $W.get_safe_value(...)
+      - pattern: os.path.basename(...)
+      - pattern: werkzeug.utils.secure_filename(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: open($P, ...)
+              - pattern: codecs.open($P, ...)
+              - pattern: io.open($P, ...)
+              - pattern: pathlib.Path(...)
+              - pattern: os.path.exists($P)
+              - pattern: os.remove($P)
+              - pattern: os.unlink($P)
+              - pattern: shutil.$FN($P, ...)
+              - pattern: flask.send_file($P, ...)
+          # Early-return containment check before the sink: `if not path.startswith(base): return ...`
+          - pattern-not-inside: |
+              if <... $X.startswith(...) ...>:
+                ...
+                return ...
+              ...
+
+  # ── CWE-79 cross-site scripting ────────────────────────────────────────
+  - id: vtest-flask-xss
+    mode: taint
+    languages: [python]
+    severity: ERROR
+    message: Request data is returned in the HTTP response without HTML escaping.
+    metadata:
+      <<: *meta
+      cwe: ["CWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"]
+      confidence: MEDIUM
+    pattern-sources: *request_sources
+    pattern-sanitizers:
+      - pattern: int(...)
+      - pattern: $W.get_safe_value(...)
+      - pattern: html.escape(...)
+      - pattern: markupsafe.escape(...)
+      - pattern: flask.escape(...)
+      - pattern: escape_for_html(...)
+      - pattern: helpers.utils.escape_for_html(...)
+      # Responses that are not rendered as HTML by the browser.
+      - pattern: flask.redirect(...)
+      - pattern: flask.jsonify(...)
+      - pattern: flask.send_file(...)
+      # Values placed in response headers (make_response((body, headers))) are not rendered as HTML.
+      - patterns:
+          - pattern-inside: flask.make_response(($BODY, $HEADERS, ...))
+          - pattern: $HEADERS
+    pattern-sinks:
+      - patterns:
+          - pattern-inside: |
+              @$APP.route(...)
+              def $VIEW(...):
+                ...
+          - pattern: return $X
+          - focus-metavariable: $X
+      - pattern: flask.make_response($X, ...)
+      - pattern: flask.render_template_string($X, ...)
+
+  # ── CWE-78 OS command injection ────────────────────────────────────────
+  - id: vtest-command-injection
+    mode: taint
+    languages: [python]
+    severity: ERROR
+    message: Request data reaches an OS command.
+    metadata:
+      <<: *meta
+      cwe: ["CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"]
+      confidence: MEDIUM
+    pattern-sources: *request_sources
+    pattern-sanitizers:
+      - pattern: shlex.quote(...)
+      - pattern: int(...)
+      - pattern: $W.get_safe_value(...)
+    pattern-sinks:
+      - patterns:
+          - pattern: subprocess.$FN($CMD, ..., shell=True, ...)
+          - focus-metavariable: $CMD
+      - pattern: os.system($CMD)
+      - pattern: os.popen($CMD, ...)
+
+  # ── CWE-89 SQL injection ───────────────────────────────────────────────
+  - id: vtest-sql-injection
+    mode: taint
+    languages: [python]
+    severity: ERROR
+    message: Request data is built into an SQL statement. Use query parameters instead.
+    metadata:
+      <<: *meta
+      cwe: ["CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"]
+      confidence: MEDIUM
+    pattern-sources: *request_sources
+    pattern-sanitizers: *generic_sanitizers
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $C.execute($Q, ...)
+              - pattern: $C.executemany($Q, ...)
+              - pattern: $C.executescript($Q)
+          - focus-metavariable: $Q
+
+  # ── CWE-90 LDAP injection ──────────────────────────────────────────────
+  - id: vtest-ldap-injection
+    mode: taint
+    languages: [python]
+    severity: ERROR
+    message: Request data is built into an LDAP search filter. Escape it with escape_filter_chars().
+    metadata:
+      <<: *meta
+      cwe: ["CWE-90: Improper Neutralization of Special Elements used in an LDAP Query ('LDAP Injection')"]
+      confidence: MEDIUM
+    pattern-sources: *request_sources
+    pattern-sanitizers:
+      - pattern: int(...)
+      - pattern: $W.get_safe_value(...)
+      - pattern: ldap3.utils.conv.escape_filter_chars(...)
+      - pattern: escape_filter_chars(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $CONN.search($BASE, $FILTER, ...)
+              - pattern: $CONN.search_s($BASE, $SCOPE, $FILTER, ...)
+          - focus-metavariable: $FILTER
+
+  # ── CWE-643 XPath injection ────────────────────────────────────────────
+  - id: vtest-xpath-injection
+    mode: taint
+    languages: [python]
+    severity: ERROR
+    message: Request data is built into an XPath query.
+    metadata:
+      <<: *meta
+      cwe: ["CWE-643: Improper Neutralization of Data within XPath Expressions ('XPath Injection')"]
+      confidence: MEDIUM
+    pattern-sources: *request_sources
+    pattern-sanitizers:
+      - pattern: int(...)
+      - pattern: $W.get_safe_value(...)
+      - pattern: $X.replace(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: elementpath.select($ROOT, $Q, ...)
+              - pattern: $ROOT.xpath($Q, ...)
+              - pattern: lxml.etree.XPath($Q, ...)
+              - pattern: $ROOT.findall($Q, ...)
+              - pattern: $ROOT.find($Q, ...)
+              - pattern: $ROOT.iterfind($Q, ...)
+          - focus-metavariable: $Q
+
+  # ── CWE-501 trust boundary violation ───────────────────────────────────
+  - id: vtest-trust-boundary
+    mode: taint
+    languages: [python]
+    severity: WARNING
+    message: Request data is stored in the server-side session without validation.
+    metadata:
+      <<: *meta
+      cwe: ["CWE-501: Trust Boundary Violation"]
+      confidence: MEDIUM
+    pattern-sources: *request_sources
+    pattern-sanitizers: *generic_sanitizers
+    pattern-sinks:
+      # Untrusted data as the session value or as the session key.
+      - patterns:
+          - pattern-inside: flask.session[$K] = $V
+          - pattern: $V
+      - patterns:
+          - pattern-inside: flask.session[$K] = $V
+          - pattern: $K
+
+  # ── CWE-601 open redirect ──────────────────────────────────────────────
+  - id: vtest-open-redirect
+    mode: taint
+    languages: [python]
+    severity: WARNING
+    message: Request data decides the redirect target. Allow-list the destination.
+    metadata:
+      <<: *meta
+      cwe: ["CWE-601: URL Redirection to Untrusted Site ('Open Redirect')"]
+      confidence: MEDIUM
+    pattern-sources: *request_sources
+    pattern-sanitizers: *generic_sanitizers
+    pattern-sinks:
+      - patterns:
+          - pattern: flask.redirect($URL, ...)
+          - focus-metavariable: $URL
+          # Early-return allow-list check: `if url.netloc not in [...]: return ...`
+          - pattern-not-inside: |
+              if <... $U.netloc ...>:
+                ...
+                return ...
+              ...
+
+  # ── CWE-94 code injection ──────────────────────────────────────────────
+  - id: vtest-code-injection
+    mode: taint
+    languages: [python]
+    severity: ERROR
+    message: Request data is evaluated as Python code.
+    metadata:
+      <<: *meta
+      cwe: ["CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')"]
+      confidence: MEDIUM
+    pattern-sources: *request_sources
+    pattern-sanitizers: *generic_sanitizers
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: eval($CODE, ...)
+              - pattern: exec($CODE, ...)
+          - focus-metavariable: $CODE
+          # Early-return check that the input is a plain literal before evaluating it.
+          - pattern-not-inside: |
+              if <... $X.startswith(...) ...>:
+                ...
+                return ...
+              ...
+
+  # ── CWE-502 unsafe deserialization ─────────────────────────────────────
+  - id: vtest-unsafe-deserialization
+    mode: taint
+    languages: [python]
+    severity: ERROR
+    message: Request data is deserialized with an unsafe loader.
+    metadata:
+      <<: *meta
+      cwe: ["CWE-502: Deserialization of Untrusted Data"]
+      confidence: MEDIUM
+    pattern-sources: *request_sources
+    pattern-sanitizers: *generic_sanitizers
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: pickle.loads($DATA, ...)
+              - pattern: pickle.load($DATA, ...)
+              - pattern: yaml.unsafe_load($DATA, ...)
+              - patterns:
+                  - pattern: yaml.load($DATA, ...)
+                  - pattern-not: yaml.load($DATA, Loader=yaml.SafeLoader, ...)
+                  - pattern-not: yaml.load($DATA, Loader=yaml.CSafeLoader, ...)
+                  - pattern-not: yaml.load($DATA, Loader=SafeLoader, ...)
+          - focus-metavariable: $DATA
+
+  # ── CWE-330 weak randomness for security values ────────────────────────
+  # A pattern rule rather than taint: Semgrep's taint engine does not carry taint through
+  # Python slices (e.g. str(random.random())[2:]), which is a common way to build tokens.
+  - id: vtest-weak-random-secret
+    languages: [python]
+    severity: WARNING
+    message: A non-cryptographic random value is used for a session, cookie or secret. Use the secrets module.
+    metadata:
+      <<: *meta
+      cwe: ["CWE-330: Use of Insufficiently Random Values"]
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          # stored directly in a session/cookie/token store
+          - patterns:
+              - pattern: $STORE[$K] = <... random.$FN(...) ...>
+              - metavariable-regex: {metavariable: $STORE, regex: '(?i).*(session|cookie|token).*'}
+          # set as a cookie value
+          - pattern: $RESP.set_cookie($NAME, <... random.$FN(...) ...>, ...)
+          # assigned to a secret-named variable
+          - patterns:
+              - pattern: $SECRET = <... random.$FN(...) ...>
+              - metavariable-regex:
+                  metavariable: $SECRET
+                  regex: '(?i).*(token|secret|password|passwd|nonce|salt|otp|csrf|api_?key|session_?id).*'
+          # stored through one intermediate variable
+          - patterns:
+              - pattern: |
+                  $V = <... random.$FN(...) ...>
+                  ...
+                  $STORE[$K] = <... $V ...>
+              - metavariable-regex: {metavariable: $STORE, regex: '(?i).*(session|cookie|token).*'}
+          - pattern: |
+              $V = <... random.$FN(...) ...>
+              ...
+              $RESP.set_cookie($NAME, <... $V ...>, ...)
+      - metavariable-regex:
+          metavariable: $FN
+          regex: ^(random|randint|randrange|randbytes|getrandbits|choice|choices|sample|uniform|triangular|normalvariate|gauss|lognormvariate|expovariate|vonmisesvariate|gammavariate|betavariate|paretovariate|weibullvariate|binomialvariate)$
+
+  # ── CWE-328 weak hash selected by name ─────────────────────────────────
+  - id: vtest-weak-hash-by-name
+    languages: [python]
+    severity: WARNING
+    message: hashlib.new() is called with a weak algorithm. Use SHA-256 or stronger.
+    metadata:
+      <<: *meta
+      cwe: ["CWE-328: Use of Weak Hash"]
+      confidence: HIGH
+    patterns:
+      - pattern: hashlib.new("$ALG", ...)
+      - metavariable-regex:
+          metavariable: $ALG
+          regex: (?i)^(md2|md4|md5|sha1|sha-1|ripemd160)$
+
+  # ── CWE-614 cookie without the Secure flag ─────────────────────────────
+  - id: vtest-cookie-not-secure
+    languages: [python]
+    severity: WARNING
+    message: A cookie is set with secure=False, so it can be sent over plain HTTP.
+    metadata:
+      <<: *meta
+      cwe: ["CWE-614: Sensitive Cookie in HTTPS Session Without 'Secure' Attribute"]
+      confidence: HIGH
+    pattern: $RESP.set_cookie(..., secure=False, ...)

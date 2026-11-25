@@ -21,7 +21,7 @@ It orchestrates three specialized sub-agents in parallel to assess code quality 
 * **Core/CLI:** Python 3.10+, Typer, Rich
 * **Sandbox:** Podman (rootless, recommended) or Docker
 * **LLM Engine:** Groq API (`openai/gpt-oss-20b`), opt-in
-* **Static Analysis:** Semgrep OSS (`p/owasp-top-ten` by default, or a local ruleset)
+* **Static Analysis:** Semgrep OSS (`p/owasp-top-ten` by default, or a local ruleset) plus vtest's own rule pack (`vtest/rules/python-web.yml`)
 * **Performance Testing:** k6 (runs inside the sandbox)
 * **Data Validation:** Pydantic
 * **Graphing & Context:** NetworkX, Pathspec
@@ -36,7 +36,7 @@ vtest analyzes code it does not trust. A repository can contain hostile code, an
 |---|---|---|
 | CLI, ingestion, report writing | Host | Trusted vtest code; never executes repository code |
 | Semgrep | Host | Trusted tool; static analysis only (reads files, executes nothing) |
-| pytest + repository code + LLM-generated tests | **Sandbox** (`localhost/vtest-pytest:1`) | Executes untrusted code |
+| pytest + repository code + LLM-generated tests | **Sandbox** (`localhost/vtest-pytest:2`) | Executes untrusted code |
 | Target app (stress test) | **Sandbox** (base or `--install-deps` image) | Executes untrusted code |
 | k6 load generator | **Sandbox** (`localhost/vtest-k6:1`) | Joins only the app's isolated network |
 
@@ -59,9 +59,10 @@ vtest **fails closed**: if neither Podman nor Docker is available, or the runtim
 
 * **Routing call:** language, framework and file count only. No source code.
 * **Unit-test generation:** for each Python file (up to 50), function/class signatures and docstrings. If a file can't be parsed, its first 3,000 characters are sent instead.
+* **Failure review:** when generated tests fail, vtest first discards failures caused by the test itself (wrong arguments, broken test code). For the remaining failures it sends the failing tests, their error messages and the source of the project functions involved (up to 6,000 characters), so the model can judge whether the code or the test is wrong. Only failures judged to be real code defects are reported.
 * Before sending, a regex scrubber redacts apparent credentials: private keys, AWS/GitHub/GitLab/Slack/Groq/OpenAI/Anthropic/Stripe/Google keys, JWTs, passwords in URLs, and quoted values assigned to names like `password`, `secret`, `token` or `api_key`. Redaction is best-effort: an unusual secret format can still get through.
 * Repository content is wrapped in unguessable delimiters and the model is told to treat it as data, never instructions.
-* Each request is capped at 4,096 output tokens (1,024 for routing), with a 60-second timeout and at most 2 retries. The routing reply must match a strict schema, or the run stops.
+* Each request is capped at 4,096 output tokens (1,500 for failure review, 1,024 for routing), with a 60-second timeout and at most 2 retries. The routing reply must match a strict schema, or the run stops.
 
 Without `--allow-llm-upload`, vtest makes **no** Groq requests: it runs Semgrep, and the stress test if you give `--app-cmd` for a web framework. LLM-generated unit tests are skipped.
 
@@ -97,7 +98,7 @@ pip install .
 vtest sandbox-build
 ```
 
-This builds `localhost/vtest-pytest:1` and `localhost/vtest-k6:1` from the Containerfiles in `vtest/sandbox/`. Base images are pinned by digest and pulled from Docker Hub, so this step needs network access. After that, sandbox images are never pulled automatically (`--pull=never`). vtest uses Podman when it's installed; set `VTEST_CONTAINER_RUNTIME=docker` to force Docker.
+This builds `localhost/vtest-pytest:2` and `localhost/vtest-k6:1` from the Containerfiles in `vtest/sandbox/`. Base images are pinned by digest and pulled from Docker Hub, so this step needs network access. After that, sandbox images are never pulled automatically (`--pull=never`). vtest uses Podman when it's installed; set `VTEST_CONTAINER_RUNTIME=docker` to force Docker.
 
 **Configuration (only needed for `--allow-llm-upload`):**
 
@@ -142,7 +143,7 @@ vtest stress . --install-deps --app-cmd "python3 app.py" --port 5000
 |---|---|
 | `vtest sandbox-build` | Builds the pytest and k6 sandbox images. Run once before using the Unit or Stress agents. |
 | `vtest analyze PATH` | Runs the full suite. Without `--allow-llm-upload`, makes no LLM calls. |
-| `--allow-llm-upload` | Consent to sending redacted code skeletons and repo metadata to the Groq API. Required for LLM routing and LLM-generated unit tests. Off by default. |
+| `--allow-llm-upload` | Consent to sending redacted code skeletons, the redacted source of functions involved in failing generated tests, and repo metadata to the Groq API. Required for LLM routing and LLM-generated unit tests. Off by default. |
 | `--app-cmd "CMD"` | Command that starts the target app **inside the sandbox** (e.g. `"python3 -m uvicorn main:app --port 3000"`). Required for stress testing. |
 | `--port N` | Port the app listens on inside the sandbox (default 3000). |
 | `--install-deps` | Builds a sandbox image with the repo's root `requirements.txt`, using **wheels only** (`pip --only-binary=:all:`), so no package setup scripts run. Lines with `-r`, `-e`, index URLs, direct URLs or local paths are ignored. If the build fails (e.g. a package has no wheel), vtest falls back to the base image. |
@@ -161,6 +162,39 @@ Upon completion, `vtest` renders a color-coded Rich matrix in your terminal and 
 2. **`fix-brief.md`**: A machine-readable `<vibe_audit>` XML prompt containing execution traces, locations, and rule violations. Untrusted content is escaped and labelled `trust="untrusted"`.
 
 **The Handoff:** Review `fix-brief.md`, then feed it into Claude Code, Cursor, or your preferred agentic CLI to patch the identified security and logic flaws.
+
+## 🎯 Detection Quality
+
+The Security agent runs the configured Semgrep ruleset together with vtest's own rule pack, [`vtest/rules/python-web.yml`](vtest/rules/python-web.yml). The pack is local, so it also works offline. It holds 13 rules, each tagged with its CWE:
+
+* **Taint rules for web request data:** path traversal, XSS, command, SQL, LDAP and XPath injection, trust boundary, open redirect, code injection and unsafe deserialization. They recognise common sanitizers and early-return validation checks.
+* **Pattern rules:** non-cryptographic randomness used for sessions, cookies or secrets; `hashlib.new()` with a weak algorithm; cookies set with `secure=False`.
+
+Findings from Semgrep *audit* rules flag a risky API without evidence that untrusted data reaches it, such as any `eval()` or any XML parser. They're reported as **Hygiene** at low severity.
+
+**Measured on the OWASP Benchmark for Python** (`python3 -m evaluation.run owasp`): the rules were written using 710 cases, and the score below comes from 520 held-out cases that were never used for development. A finding counts only if its CWE matches the case's weakness:
+
+| | Registry ruleset only | + vtest rule pack |
+|---|---|---|
+| Recall | 15.1% | 67.6% |
+| False-positive rate | 0.6% | 9.7% |
+| Score (recall − FPR; 0 = random) | +14.5 | **+57.9** |
+
+**Known limits:**
+* Weak randomness, weak hashes and insecure cookies are detected reliably. Path traversal, XPath and LDAP injection remain weak.
+* Semgrep's free taint engine doesn't carry taint through Python slices (`value[4:-17]`) or across files, and it can lose taint in dicts written with several constant keys.
+* Like any analysis that doesn't evaluate branches, the rules can't tell when a constant condition makes a data flow unreachable.
+
+## 🧪 Development
+
+Run the regression suite (security properties, sandbox isolation, report hardening, CLI behaviour):
+
+```bash
+pip install -e ".[dev]"
+python3 -m pytest
+```
+
+Tests marked `sandbox` need Podman/Docker and `vtest sandbox-build`; tests marked `semgrep` need Semgrep. They are skipped automatically when those are missing. No test calls the Groq API.
 
 ## ⚠️ Known Limitations
 

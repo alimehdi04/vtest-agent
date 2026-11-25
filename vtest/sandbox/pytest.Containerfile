@@ -1,4 +1,4 @@
-# vtest pytest sandbox image: localhost/vtest-pytest:1
+# vtest pytest sandbox image: localhost/vtest-pytest:2
 # Runs repository code and LLM-generated tests. Base image pinned by digest.
 FROM docker.io/library/python:3.14-slim@sha256:ec6a14df5b63e3fbb3498e3240f7f640c230f9dca67683d23265db3866697f2d
 

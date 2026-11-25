@@ -173,11 +173,17 @@ def _write_report(out_fd: int, name: str, content: str) -> None:
 
 # ── Report builders ─────────────────────────────────────────────────────────
 
-def build_audit_report(context: dict, all_findings: list) -> str:
+def build_audit_report(context: dict, all_findings: list, incomplete: list = ()) -> str:
     parts: list[str] = []
     parts.append(f"# 🛡️ vtest Audit Report — {_md_inline(os.path.basename(str(context['path'])))}\n\n")
     parts.append(f"**Tech Stack:** {_md_inline(context['primary_language'])} / {_md_inline(context['framework'])}\n")
     parts.append(f"**Total Issues:** {len(all_findings)}\n\n")
+    if incomplete:
+        parts.append("> ⚠️ **Incomplete run:** some agents could not finish, so these results are partial.\n>\n")
+        for agent, message in incomplete:
+            text, _ = _truncate(str(message), 1000)
+            parts.append(f"> - **{_md_inline(agent)}:** {_md_inline(text)}\n")
+        parts.append("\n")
     parts.append("> Logs below are untrusted output from the scanned code and tools.\n\n")
     parts.append("---\n\n## 📊 Findings Summary\n\n")
     parts.append("| ID | Severity | Agent | File:Line | Issue |\n")
@@ -221,7 +227,7 @@ def _sub(parent: ET.Element, tag: str, text: object = None, **attrs: str) -> ET.
     return el
 
 
-def build_fix_brief(context: dict, all_findings: list) -> str:
+def build_fix_brief(context: dict, all_findings: list, incomplete: list = ()) -> str:
     root = ET.Element("vibe_audit", {"version": "2"})
 
     fp = _sub(root, "system_fingerprint")
@@ -230,6 +236,11 @@ def build_fix_brief(context: dict, all_findings: list) -> str:
     _sub(fp, "files_scanned", context["total_files"])
 
     _sub(root, "instructions", _BRIEF_INSTRUCTIONS, trust="trusted")
+
+    status = _sub(root, "run_status", complete=str(not incomplete).lower())
+    for agent, message in incomplete:
+        text, _ = _truncate(str(message), 1000)
+        _sub(status, "incomplete_agent", text, agent=agent, trust="untrusted")
 
     evals = _sub(root, "diagnostic_evaluations")
     for issue in all_findings:
@@ -243,15 +254,15 @@ def build_fix_brief(context: dict, all_findings: list) -> str:
     return ET.tostring(root, encoding="unicode") + "\n"
 
 
-def generate_reports(context: dict, all_findings: list, repo_root: Path) -> tuple[str, str]:
+def generate_reports(context: dict, all_findings: list, repo_root: Path, incomplete: list = ()) -> tuple[str, str]:
     """
     Write audit-report.md and fix-brief.md into <repo_root>/output.
 
     Raises OutputPathError if the output directory or a report file is a
     symlink, isn't a regular file/directory, or resolves outside repo_root.
     """
-    audit = build_audit_report(context, all_findings)
-    brief = build_fix_brief(context, all_findings)
+    audit = build_audit_report(context, all_findings, incomplete)
+    brief = build_fix_brief(context, all_findings, incomplete)
 
     out_fd, out_dir = _open_output_dir(Path(repo_root))
     try:

@@ -1,5 +1,5 @@
 """
-vtest sandbox entrypoint (baked into localhost/vtest-pytest:1, never controlled by the repo).
+vtest sandbox entrypoint (baked into localhost/vtest-pytest:2, never controlled by the repo).
 
 Reads a tar stream from stdin into /work (a tmpfs), then:
 
@@ -30,6 +30,10 @@ def _run_pytest() -> None:
     # Written after extraction, so the payload cannot supply its own config.
     with open(ini, "w") as f:
         f.write("[pytest]\n")
+    # /work holds the whole project tree: put it first on the path so the module
+    # under test can import its own packages. Keep any --install-deps path after it.
+    deps = os.environ.get("PYTHONPATH")
+    os.environ["PYTHONPATH"] = WORK + (os.pathsep + deps if deps else "")
     os.execvp(sys.executable, [
         sys.executable, "-m", "pytest", "test_generated.py",
         "-c", ini, "--rootdir", WORK, "--confcutdir", WORK,

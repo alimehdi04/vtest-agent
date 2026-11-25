@@ -48,7 +48,7 @@ SANDBOX_LABEL_KEY = "vtest.sandbox"
 SANDBOX_LABEL = f"{SANDBOX_LABEL_KEY}=1"
 
 # Image names. Built locally and never pulled (``--pull=never``).
-PYTEST_IMAGE = "localhost/vtest-pytest:1"
+PYTEST_IMAGE = "localhost/vtest-pytest:2"    # :2 = entrypoint puts the project tree on PYTHONPATH
 K6_IMAGE = "localhost/vtest-k6:1"
 DEPS_IMAGE_REPO = "localhost/vtest-deps"
 
@@ -491,24 +491,37 @@ async def _force_remove(rt: ContainerRuntime, name: str) -> None:
 _PAYLOAD_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 
 
+def _add_flat_files(tar: tarfile.TarFile, files: dict[str, bytes | str]) -> None:
+    """Only plain file names are allowed: no directories, no '..', no links."""
+    for name, content in files.items():
+        if not _PAYLOAD_NAME_RE.fullmatch(name) or name in (".", ".."):
+            raise ValueError(f"Invalid sandbox payload file name: {name!r}")
+        data = content.encode("utf-8") if isinstance(content, str) else content
+        info = tarfile.TarInfo(name)
+        info.size = len(data)
+        info.mode = 0o644
+        info.mtime = 0
+        info.uid = info.gid = 0
+        info.uname = info.gname = ""
+        tar.addfile(info, io.BytesIO(data))
+
+
 def make_tar(files: dict[str, bytes | str]) -> bytes:
-    """
-    Pack flat files into an in-memory tar to send to a sandbox on stdin.
-    Only plain file names are allowed: no directories, no '..', no links.
-    """
+    """Pack flat files into an in-memory tar to send to a sandbox on stdin."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
-        for name, content in files.items():
-            if not _PAYLOAD_NAME_RE.fullmatch(name) or name in (".", ".."):
-                raise ValueError(f"Invalid sandbox payload file name: {name!r}")
-            data = content.encode("utf-8") if isinstance(content, str) else content
-            info = tarfile.TarInfo(name)
-            info.size = len(data)
-            info.mode = 0o644
-            info.mtime = 0
-            info.uid = info.gid = 0
-            info.uname = info.gname = ""
-            tar.addfile(info, io.BytesIO(data))
+        _add_flat_files(tar, files)
+    return buf.getvalue()
+
+
+def append_to_tar(tar_bytes: bytes, files: dict[str, bytes | str]) -> bytes:
+    """
+    Return a copy of an in-memory tar (e.g. from make_tree_tar) with flat files added
+    at its root. Added files come last, so they replace same-named project files on extraction.
+    """
+    buf = io.BytesIO(tar_bytes)
+    with tarfile.open(fileobj=buf, mode="a", format=tarfile.PAX_FORMAT) as tar:
+        _add_flat_files(tar, files)
     return buf.getvalue()
 
 

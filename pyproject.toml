@@ -19,8 +19,20 @@ dependencies = [
     "python-dotenv>=1.0.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [project.scripts]
 vtest = "vtest.main:app"
+
+# Regression suite only: tests/ also holds untracked benchmark datasets that must not be collected.
+[tool.pytest.ini_options]
+testpaths = ["tests/regression"]
+pythonpath = ["."]
+markers = [
+    "sandbox: needs Podman/Docker and the vtest sandbox images (`vtest sandbox-build`)",
+    "semgrep: needs semgrep on PATH",
+]
 
 [tool.setuptools.packages.find]
 include = ["vtest*"]
@@ -28,3 +40,4 @@ include = ["vtest*"]
 # Sandbox assets: Containerfiles, the pinned pytest requirements and the fixed k6 template.
 [tool.setuptools.package-data]
 "vtest.sandbox" = ["*.Containerfile", "*.js", "*.txt"]
+"vtest.rules" = ["*.yml"]
