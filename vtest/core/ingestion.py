@@ -9,7 +9,7 @@ def _get_pathspec(base_path: Path):
     gitignore = base_path / ".gitignore"
     if gitignore.is_file() and not gitignore.is_symlink():
         lines.extend(gitignore.read_text(errors="ignore").splitlines())
-    return pathspec.PathSpec.from_lines(pathspec.patterns.GitWildMatchPattern, lines)
+    return pathspec.GitIgnoreSpec.from_lines(lines)
 
 def scan_codebase(base_path: str) -> dict:
     """Walks the directory respecting .gitignore to detect language and build the AST graph."""
